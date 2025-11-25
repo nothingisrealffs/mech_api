@@ -1,0 +1,24 @@
+# requirements.txt
+# BattleTech Database Manager Dependencies
+
+# Core database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0  # PostgreSQL support
+
+# Data validation
+pydantic>=2.0.0
+
+# CLI/TUI
+rich>=13.0.0
+tqdm>=4.65.0
+
+# API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Utilities
+python-dateutil>=2.8.0
+
+# Optional: for advanced features
+# redis>=5.0.0  # for API caching
+# gunicorn>=21.0.0  # for production deployment
