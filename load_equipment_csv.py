@@ -331,46 +331,93 @@ def create_common_aliases(session):
     These are based on common MTF file variations.
     """
     common_mappings = {
-        # Autocannons
-        'autocannon 2': ['ac2', 'ac 2', 'ac/2'],
-        'autocannon 5': ['ac5', 'ac 5', 'ac/5'],
-        'autocannon 10': ['ac10', 'ac 10', 'ac/10'],
-        'autocannon 20': ['ac20', 'ac 20', 'ac/20'],
-        'ultra autocannon 5': ['uac5', 'uac 5', 'ultra ac 5'],
-        'ultra autocannon 10': ['uac10', 'uac 10', 'ultra ac 10'],
-        'ultra autocannon 20': ['uac20', 'uac 20', 'ultra ac 20'],
+        # Autocannons - MTF uses "Autocannon/X" format
+        'autocannon 2': ['ac2', 'ac 2', 'ac/2', 'autocannon/2'],
+        'autocannon 5': ['ac5', 'ac 5', 'ac/5', 'autocannon/5'],
+        'autocannon 10': ['ac10', 'ac 10', 'ac/10', 'autocannon/10'],
+        'autocannon 20': ['ac20', 'ac 20', 'ac/20', 'autocannon/20'],
+        'ultra autocannon 5': ['uac5', 'uac 5', 'ultra ac 5', 'ultra ac/5'],
+        'ultra autocannon 10': ['uac10', 'uac 10', 'ultra ac 10', 'ultra ac/10'],
+        'ultra autocannon 20': ['uac20', 'uac 20', 'ultra ac 20', 'ultra ac/20'],
         
-        # Lasers
-        'large laser': ['ll', 'l laser', 'large las'],
-        'medium laser': ['ml', 'm laser', 'med laser'],
-        'small laser': ['sl', 's laser', 'small las'],
-        'large pulse laser': ['lpl', 'l pulse', 'large pulse'],
-        'medium pulse laser': ['mpl', 'm pulse', 'med pulse'],
-        'small pulse laser': ['spl', 's pulse', 'small pulse'],
+        # Lasers - MTF uses "Size Laser" format (e.g., "Large Laser")
+        'laser lg': ['large laser', 'll', 'l laser', 'large las', 'large laser r'],
+        'laser med': ['medium laser', 'ml', 'm laser', 'med laser', 'medium laser r'],
+        'laser sm': ['small laser', 'sl', 's laser', 'small las', 'small laser r'],
+        'laser lg pulse': ['large pulse laser', 'lpl', 'l pulse', 'large pulse'],
+        'laser med pulse': ['medium pulse laser', 'mpl', 'm pulse', 'med pulse'],
+        'laser sm pulse': ['small pulse laser', 'spl', 's pulse', 'small pulse'],
+        'laser er lg': ['er large laser', 'er ll', 'er l laser', 'large laser er'],
+        'laser er med': ['er medium laser', 'er ml', 'er m laser', 'medium laser er'],
+        'laser er sm': ['er small laser', 'er sl', 'er s laser', 'small laser er'],
         
-        # Missiles
-        'lrm 5': ['lrm5', 'lrm-5'],
-        'lrm 10': ['lrm10', 'lrm-10'],
-        'lrm 15': ['lrm15', 'lrm-15'],
-        'lrm 20': ['lrm20', 'lrm-20'],
-        'srm 2': ['srm2', 'srm-2'],
-        'srm 4': ['srm4', 'srm-4'],
-        'srm 6': ['srm6', 'srm-6'],
+        # Missiles - MTF uses "LRM X" or "LRM-X" format
+        'lrm05': ['lrm 5', 'lrm5', 'lrm-5'],
+        'lrm10': ['lrm 10', 'lrm-10'],
+        'lrm15': ['lrm 15', 'lrm-15'],
+        'lrm20': ['lrm 20', 'lrm-20'],
+        'srm2': ['srm 2', 'srm-2', 'srm 2 r'],
+        'srm4': ['srm 4', 'srm-4', 'srm 4 r'],
+        'srm6': ['srm 6', 'srm-6', 'srm 6 r'],
         
-        # Other
+        # Other common weapons
         'gauss rifle': ['gauss', 'g rifle'],
         'machine gun': ['mg', 'm gun'],
         'particle projection cannon': ['ppc'],
+        'ppc': ['particle projection cannon'],
+        
+        # Rear-facing variants (MTF uses "(R)" suffix) are included above
+        # (merged into the main alias lists so keys do not collide)
     }
     
     print("\nCreating common aliases...")
     for canonical, aliases in common_mappings.items():
-        # Find weapon by normalized canonical name
+        # Find weapon by normalized canonical name (try several fallbacks)
         normalized_canonical = normalize_weapon_name(canonical)
-        weapon = session.query(Weapon).filter(
-            Weapon.name == normalized_canonical
-        ).first()
-        
+
+        weapon = session.query(Weapon).filter(Weapon.name == normalized_canonical).first()
+
+        # If the canonical key doesn't match a DB name (e.g. mapping uses
+        # abbreviations like 'laser lg' but DB contains 'large laser') try
+        # a set of candidate names generated from the mapping key to find
+        # an existing weapon record.
+        if not weapon:
+            # Candidates include the canonical plus generated aliases for it
+            candidates = set()
+            candidates.add(normalized_canonical)
+            # Use generate_weapon_aliases to create reasonable variations
+            try:
+                gen = generate_weapon_aliases(canonical)
+                for g in gen:
+                    candidates.add(normalize_weapon_name(g))
+            except Exception:
+                # keep going if generator fails for some reason
+                pass
+
+            # Also try swapping token order ("laser lg" -> "lg laser") and
+            # the obvious 'size first' form ("laser lg" -> "large laser")
+            parts = normalized_canonical.split()
+            if len(parts) == 2:
+                a, b = parts
+                candidates.add(f"{b} {a}")
+                # Expand size abbreviations to common words
+                size_map = {'lg': 'large', 'med': 'medium', 'sm': 'small', 'l': 'large', 'm': 'medium', 's': 'small'}
+                if a in size_map:
+                    candidates.add(f"{size_map[a]} {b}")
+                if b in size_map:
+                    candidates.add(f"{a} {size_map[b]}")
+                    # also try putting the size word first -> 'large laser'
+                    candidates.add(f"{size_map[b]} {a}")
+
+            # Look up the first matching candidate in DB
+            for cand in candidates:
+                if not cand:
+                    continue
+                weapon = session.query(Weapon).filter(Weapon.name == cand).first()
+                if weapon:
+                    print(f"  Found weapon for mapping '{canonical}' using candidate: {cand}")
+                    break
+
         if not weapon:
             print(f"  Warning: Weapon not found: {normalized_canonical}")
             continue

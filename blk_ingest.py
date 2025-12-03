@@ -29,8 +29,10 @@ from sqlalchemy.exc import IntegrityError
 # Import shared components from mtf_ingest_fixed
 from mtf_ingest import (
     Base, Weapon, WeaponAlias, ComponentType, Manufacturer, Factory,
-    get_engine_and_session, normalize_token,
-    USE_POSTGRES, POSTGRES_DSN, EMPTY_TOKEN_VARIANTS
+    get_engine_and_session, normalize_token, resolve_component_type,
+    fetch_bv_pv_from_pull, enqueue_bv_pv_job,
+    USE_POSTGRES, POSTGRES_DSN, EMPTY_TOKEN_VARIANTS, BV_PV_MODE_DEFAULT,
+    guess_parsed_type
 )
 
 # -----------------------------
@@ -55,6 +57,8 @@ class Vehicle(Base):
     tonnage = Column(Float)
     fuel_type = Column(String)
     source = Column(String)
+    bv = Column(Integer, nullable=True)
+    pv = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     raw_doc = Column(Text)
     
@@ -118,6 +122,7 @@ class StagingVehicleSlot(Base):
     raw_text = Column(Text)
     parsed_name = Column(String, index=True)
     parsed_type = Column(String, index=True)  # 'weapon', 'ammo', 'component'
+    component_type_id = Column(Integer, ForeignKey("component_type.id"), nullable=True, index=True)
     weapon_id = Column(Integer, ForeignKey("weapon.id"), nullable=True, index=True)
     resolved = Column(Boolean, default=False)
     resolution_hint = Column(String)
@@ -311,40 +316,7 @@ def parse_blk_text(text: str) -> ParsedVehicle:
     
     return parsed
 
-# -----------------------------
-# Ingestion logic
-# -----------------------------
-
-def guess_parsed_type(raw_line: str) -> str:
-    """Determine if equipment line is weapon, ammo, or component"""
-    if raw_line is None:
-        return "unknown"
-    t = raw_line.lower()
-    
-    # Ammo detection
-    if "ammo" in t or re.search(r"\b(ammo|ammunition)\b", t):
-        return "ammo"
-    
-    # Weapon detection (common patterns)
-    weapon_patterns = [
-        r"\b(lrm|srm|ac|laser|ppc|gauss|ml|large|medium|small|mg|machine gun)\b",
-        r"\b(autocannon|missile|flamer|cannon)\b"
-    ]
-    for pattern in weapon_patterns:
-        if re.search(pattern, t):
-            return "weapon"
-    
-    # Component/equipment
-    if any(kw in t for kw in ["engine", "gyro", "sensor", "heat sink", "case", "armor"]):
-        return "component"
-    
-    # Empty slot
-    if raw_line.strip().lower() in {v.lower() for v in EMPTY_TOKEN_VARIANTS}:
-        return "empty"
-    
-    return "unknown"
-
-def ingest_parsed_vehicle(session, parsed: ParsedVehicle, source_filename: str) -> Tuple[int, List[int]]:
+def ingest_parsed_vehicle(session, parsed: ParsedVehicle, source_filename: str, bv_pv_mode: str = BV_PV_MODE_DEFAULT) -> Tuple[int, List[int]]:
     """
     Insert vehicle and create staging rows for equipment.
     Returns (vehicle_id, list_of_staging_ids)
@@ -380,7 +352,21 @@ def ingest_parsed_vehicle(session, parsed: ParsedVehicle, source_filename: str) 
         )
         session.add(vehicle)
         session.flush()
-    
+
+    # Handle BV/PV lookup choice (vehicles use MUL type 19)
+    if bv_pv_mode == "sync":
+        try:
+            bv_val, pv_val = fetch_bv_pv_from_pull(name, parsed.model, mul_type=19)
+            if bv_val is not None:
+                vehicle.bv = bv_val
+            if pv_val is not None:
+                vehicle.pv = pv_val
+            session.flush()
+        except Exception:
+            pass
+    elif bv_pv_mode == "enqueue":
+        enqueue_bv_pv_job(session, "vehicle", name, parsed.model, mul_type="19")
+
     staging_ids = []
     
     # Create VehicleLocation and staging slots for equipment
@@ -393,6 +379,9 @@ def ingest_parsed_vehicle(session, parsed: ParsedVehicle, source_filename: str) 
             raw_line = raw_line.strip()
             parsed_name = normalize_token(raw_line)
             parsed_type = guess_parsed_type(raw_line)
+            component_type_id = None
+            if parsed_type == "component":
+                component_type_id = resolve_component_type(session, raw_line)
             
             s = StagingVehicleSlot(
                 file_name=source_filename,
@@ -402,6 +391,7 @@ def ingest_parsed_vehicle(session, parsed: ParsedVehicle, source_filename: str) 
                 raw_text=raw_line,
                 parsed_name=parsed_name,
                 parsed_type=parsed_type,
+                component_type_id=component_type_id,
                 resolved=False
             )
             session.add(s)
@@ -502,6 +492,27 @@ def resolve_vehicle_staging(session):
             updated += 1
     
     session.flush()
+
+    # Mark component slots as resolved when component_type_id is present
+    component_rows = session.query(StagingVehicleSlot).filter(
+        StagingVehicleSlot.parsed_type == 'component',
+        StagingVehicleSlot.component_type_id != None,
+        StagingVehicleSlot.resolved == False
+    ).all()
+    for s in component_rows:
+        s.resolved = True
+        s.resolution_hint = "component"
+        updated += 1
+
+    # Mark empty slots as resolved
+    empty_rows = session.query(StagingVehicleSlot).filter(
+        StagingVehicleSlot.parsed_type == 'empty',
+        StagingVehicleSlot.resolved == False
+    ).all()
+    for s in empty_rows:
+        s.resolved = True
+        s.resolution_hint = "empty"
+        updated += 1
     
     # Count unresolved
     unresolved = session.query(StagingVehicleSlot).filter(
@@ -567,6 +578,7 @@ def finalize_vehicle_slots(session):
             location_id=loc.id,
             slot_index=s.slot_index,
             raw_text=s.raw_text,
+            component_type_id=s.component_type_id,
             note=note
         )
         session.add(slot)
@@ -595,7 +607,7 @@ def discover_blk_files(folder: Path) -> List[Path]:
     """Find all .blk files in folder"""
     return sorted([p for p in folder.glob("*.blk")] + [p for p in folder.glob("*.BLK")])
 
-def process_folder(folder: Path, session):
+def process_folder(folder: Path, session, bv_pv_mode: str = BV_PV_MODE_DEFAULT):
     """Process all BLK files in folder"""
     files = discover_blk_files(folder)
     if not files:
@@ -613,7 +625,7 @@ def process_folder(folder: Path, session):
         
         try:
             parsed = parse_blk_text(text)
-            vehicle_id, staging_ids = ingest_parsed_vehicle(session, parsed, str(f.name))
+            vehicle_id, staging_ids = ingest_parsed_vehicle(session, parsed, str(f.name), bv_pv_mode=bv_pv_mode)
             session.commit()
             stats["files"] += 1
             stats["staging_rows"] += len(staging_ids)
@@ -631,6 +643,7 @@ def main():
     parser.add_argument("--reconcile", action="store_true", help="Resolve staging to weapons")
     parser.add_argument("--finalize", action="store_true", help="Finalize staging to production tables")
     parser.add_argument("--use-postgres", action="store_true", help="Use PostgreSQL")
+    parser.add_argument("--bv-pv-mode", choices=["enqueue", "sync", "skip"], default=BV_PV_MODE_DEFAULT, help="How to handle BV/PV lookup: enqueue for async worker (default), sync to fetch immediately, or skip")
     
     args = parser.parse_args()
     
@@ -649,7 +662,7 @@ def main():
     
     if not args.reconcile:
         print("Beginning ingest of .blk files from", folder)
-        stats = process_folder(folder, session)
+        stats = process_folder(folder, session, bv_pv_mode=args.bv_pv_mode)
         print("Ingest complete:", stats)
         print("Run with --reconcile to resolve weapons, then --finalize to create final slots.")
     else:
